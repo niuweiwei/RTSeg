@@ -97,6 +97,122 @@ class AttentionRefinementModule(nn.Module):
                 if not ly.bias is None: nn.init.constant_(ly.bias, 0)
 
 
+class GPPM(nn.Module):
+    def __init__(self, in_chans=1024, mid_chans=128, out_chans=128, group_num=4):
+        super(GPPM, self).__init__()
+        self.group_chans = in_chans // group_num
+
+        self.scale1 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm2d(self.group_chans),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.group_chans, mid_chans, kernel_size=1, bias=False)
+        )
+        self.scale2 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=9, stride=4, padding=4),
+            nn.BatchNorm2d(self.group_chans),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.group_chans, mid_chans, kernel_size=1, bias=False)
+        )
+        self.scale3 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=17, stride=8, padding=8),
+            nn.BatchNorm2d(self.group_chans),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.group_chans, mid_chans, kernel_size=1, bias=False)
+        )
+        self.scale4 = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.BatchNorm2d(self.group_chans),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.group_chans,mid_chans, kernel_size=1, bias=False)
+        )
+        self.process1 = nn.Sequential(
+            nn.BatchNorm2d(mid_chans),
+            nn.ReLU(inplace=True)
+        )
+        self.process2 = nn.Sequential(
+            nn.BatchNorm2d(mid_chans),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_chans, mid_chans, kernel_size=3, padding=1, bias=False)
+        )
+        self.process3 = nn.Sequential(
+            nn.BatchNorm2d(mid_chans),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_chans, mid_chans, kernel_size=3, padding=1, bias=False)
+        )
+        self.process4 = nn.Sequential(
+            nn.BatchNorm2d(mid_chans),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_chans, mid_chans, kernel_size=3, padding=1, bias=False)
+        )
+        self.compression = nn.Sequential(
+            nn.BatchNorm2d(mid_chans * group_num),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_chans * group_num, out_chans, kernel_size=1, bias=False)
+        )
+        self.shortcut = nn.Conv2d(in_chans, out_chans, kernel_size=1, stride=1, bias=False)
+
+        self.init_weight()
+
+
+    def forward(self,x):
+        width = x.shape[-1]
+        height = x.shape[-2]
+
+        # 在通道维度上进行切分 分割为4个特征图
+        features = torch.split(x, self.group_chans, dim=1)
+        x1, x2, x3, x4 = features[0], features[1], features[2], features[3]
+
+        x_list = []
+        x_list.append(self.process1(
+            F.interpolate(
+                self.scale1(x1),
+                size=[height, width],
+                mode='bilinear'
+            )
+        ))  # x_list[0]
+        x_list.append(self.process2(
+            F.interpolate(
+                self.scale2(x2),
+                size=[height, width],
+                mode='bilinear'
+            ) + x_list[0]
+        ))  # x_list[1]
+        x_list.append(self.process3(
+            F.interpolate(
+                self.scale3(x3),
+                size=[height, width],
+                mode='bilinear'
+            ) + x_list[1]
+        ))  # x_list[2]
+        x_list.append(self.process4(
+            F.interpolate(
+                self.scale4(x4),
+                size=[height, width],
+                mode='bilinear'
+            ) + x_list[2]
+        ))  # x_list[3]
+        out = self.compression(torch.cat(x_list,dim=1)) + self.shortcut(x)
+        return out
+
+    def init_weight(self):
+        for ly in self.children():
+            if isinstance(ly, nn.Conv2d):
+                nn.init.kaiming_normal_(ly.weight, a=1)
+                if not ly.bias is None: nn.init.constant_(ly.bias, 0)
+
+    def get_params(self):
+        wd_params, nowd_params = [], []
+        for name, module in self.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                wd_params.append(module.weight)
+                if not module.bias is None:
+                    nowd_params.append(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                nowd_params += list(module.parameters())
+        return wd_params, nowd_params
+
+
 class ContextPath(nn.Module):
     def __init__(self, backbone='CatNetSmall', pretrain_model='', use_conv_last=False, *args, **kwargs):
         super(ContextPath, self).__init__()
@@ -122,7 +238,7 @@ class ContextPath(nn.Module):
             self.arm32 = AttentionRefinementModule(inplanes, 128)
             self.conv_head32 = ConvBNReLU(128, 128, ks=3, stride=1, padding=1)
             self.conv_head16 = ConvBNReLU(128, 128, ks=3, stride=1, padding=1)
-            self.conv_avg = ConvBNReLU(inplanes, 128, ks=1, stride=1, padding=0)
+            self.ppm = GPPM(in_chans=inplanes,mid_chans=128,out_chans=128,group_num=4)
         else:
             print("backbone is not in backbone lists")
             exit(0)
@@ -137,13 +253,10 @@ class ContextPath(nn.Module):
         H16, W16 = feat16.size()[2:]
         H32, W32 = feat32.size()[2:]
         
-        avg = F.avg_pool2d(feat32, feat32.size()[2:])
-        avg = self.conv_avg(avg)
-        print(avg.shape)
-        avg_up = F.interpolate(avg, (H32, W32), mode='nearest')
+        final_context = self.ppm(feat32)
 
         feat32_arm = self.arm32(feat32)
-        feat32_sum = feat32_arm + avg_up
+        feat32_sum = feat32_arm + final_context
         feat32_up = F.interpolate(feat32_sum, (H16, W16), mode='nearest')
         feat32_up = self.conv_head32(feat32_up)
 
